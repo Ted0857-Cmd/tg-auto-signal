@@ -1,4 +1,4 @@
-// index.js — 含快捷鍵選單 + 多週期匯總 + 3 分鐘自動掃描
+// index.js — Multi-layer scan + Per-timeframe TP + SNR filter（高勝率取向）
 // 依賴：dotenv, telegraf, ccxt, node-schedule
 require('dotenv').config();
 const { Telegraf } = require('telegraf');
@@ -14,28 +14,55 @@ function nowTW() {
   }).format(new Date());
 }
 
-/* ===== 環境變數 ===== */
+/* ===== 環境 / 幣種 / 週期分層 ===== */
 const bot = new Telegraf(process.env.BOT_TOKEN);
-const LIVE = String(process.env.LIVE || '0') === '1' || String(process.env.LIVE).toLowerCase() === 'true';
 const DEFAULT_TYPE = process.env.BINGX_TYPE || 'swap';
-const AUTO_CRON = process.env.AUTO_CRON || '*/3 * * * *'; // 每 3 分鐘掃描一次
-
-/* 幣種與週期 */
 const SYMBOLS = ['BTC/USDT','ETH/USDT','SOL/USDT','DOGE/USDT','XRP/USDT','ADA/USDT','LINK/USDT'];
-const ALL_TFS = ['5m','15m','30m','1h','4h','1d','1w'];      // 匯總用
-const TIMEFRAMES = ['5m','15m','30m','1h','4h','1d'];       // /signal
-const HTF_TIMEFRAMES = ['30m','1h','4h','1d','1w'];         // /signal_htf
 
-/* SMC/OB 參數 */
+const TFS_SHORT = ['5m','15m'];      // 每 3 分鐘掃描
+const TFS_MID   = ['30m','1h'];      // 每 10 分鐘掃描
+const TFS_LONG  = ['4h','1d','1w'];  // 每 30 分鐘掃描
+
+/* ===== SMC / OB 參數（穩健偏保守） ===== */
 const SWING_LOOKBACK = 5;
 const ATR_PERIOD = 14;
-const ATR_MULT = 0.6;
-const OB_USE_WICKS = true;        // OB 用影線
-const ENTRY_MODE = 'ob_mid';      // ob_mid | ob_top | ob_bottom
-const SL_ATR_PAD = 0.1;
-const TP_R_MULTS = [1.0, 1.5, 2.0];
+// 提高觸發門檻：放大實體 K 槓桿，抑制假突破（勝率優先）
+const ATR_MULT = 0.8;
+const OB_USE_WICKS = true;
+const ENTRY_MODE = 'ob_mid';
+const SL_ATR_PAD = 0.12; // 止損留更寬緩衝，避免微掃（勝率優先）
 
-/* 交易所（BingX 合約） */
+/* ===== TP 依週期放大（長週期給更大目標）===== */
+// 環境變數做為 fallback（可在 Render 覆寫）
+const TP_R_MULTS_DEFAULT = (process.env.TP_R_MULTS || '1.5,2.5,4.0')
+  .split(',').map(x => Number(x.trim())).filter(x => Number.isFinite(x) && x > 0);
+
+// 依週期配置（可依偏好再調整）
+const TP_BY_TF = {
+  '5m':  [1.2, 2.0, 3.0],
+  '15m': [1.3, 2.2, 3.5],
+  '30m': [1.5, 2.5, 4.0],
+  '1h':  [2.0, 3.5, 5.5],
+  '4h':  [2.5, 4.5, 7.0],
+  '1d':  [3.0, 5.5, 9.0],
+  '1w':  [4.0, 6.5, 10.0],
+};
+
+/* ===== SNR 過濾（高勝率基礎） ===== */
+// SNR = |回歸斜率| / 殘差標準差；越大表示趨勢越乾淨
+const SNR_ENABLED = true;
+const SNR_LEN = 60;  // 回看長度略增，降低雜訊（勝率優先）
+const SNR_MIN = {    // 各週期門檻（可視實測微調）
+  '5m':  1.30,
+  '15m': 1.25,
+  '30m': 1.15,
+  '1h':  1.05,
+  '4h':  0.90,
+  '1d':  0.80,
+  '1w':  0.70
+};
+
+/* ===== 交易所（BingX 合約） ===== */
 const exOpt = {
   enableRateLimit: true,
   apiKey: process.env.API_KEY || undefined,
@@ -47,328 +74,205 @@ const exchange = new ccxt.bingx(exOpt);
 /* ===== 工具 ===== */
 const toFixed = (n, p = 4) => (n == null || isNaN(n)) ? '' : Number(n).toFixed(p);
 
-function candidateSymbols(symbol) {
-  return symbol.includes(':USDT') ? [symbol] : [symbol, `${symbol}:USDT`];
+async function fetchTicker(symbol) {
+  try { return await exchange.fetchTicker(symbol); } catch (_) {}
+  try { return await exchange.fetchTicker(symbol.replace(':USDT','/USDT')); } catch (_) {}
+  throw new Error(`Ticker 無法取得 ${symbol}`);
+}
+async function fetchOHLCV(symbol, tf, limit=300) {
+  try { return await exchange.fetchOHLCV(symbol, tf, undefined, limit); } 
+  catch (_) { try { return await exchange.fetchOHLCV(symbol.replace(':USDT','/USDT'), tf, undefined, limit); } 
+  catch (e) { throw new Error(`OHLCV 無法取得 ${symbol} ${tf}`); } }
 }
 
-async function fetchTickerFlex(symbol) {
-  for (const s of candidateSymbols(symbol)) {
-    try { const t = await exchange.fetchTicker(s); return { ...t, _symbol: s }; } catch (_) {}
+/* ===== 技術計算 ===== */
+function calcATR(c, period=14) {
+  if (!c || c.length < period+1) return null;
+  const TR = [];
+  for (let i=1;i<c.length;i++){
+    const h=c[i][2], l=c[i][3], pc=c[i-1][4];
+    TR.push(Math.max(h-l, Math.abs(h-pc), Math.abs(l-pc)));
   }
-  throw new Error(`Ticker 不可用：${symbol}`);
+  return TR.slice(-period).reduce((a,b)=>a+b,0)/period;
 }
-
-async function fetchOHLCVFlex(symbol, timeframe, limit = 300) {
-  for (const s of candidateSymbols(symbol)) {
-    try { return await exchange.fetchOHLCV(s, timeframe, undefined, limit); } catch (_) {}
-  }
-  throw new Error(`OHLCV 不可用：${symbol} ${timeframe}`);
-}
-
-function calcATR(c, period = 14) {
-  if (!c || c.length < period + 1) return null;
-  const TRs = [];
-  for (let i = 1; i < c.length; i++) {
-    const h = c[i][2], l = c[i][3], pc = c[i-1][4];
-    TRs.push(Math.max(h - l, Math.abs(h - pc), Math.abs(l - pc)));
-  }
-  const last = TRs.slice(-period);
-  return last.reduce((a,b)=>a+b,0)/last.length;
-}
-
-function swingHigh(c, look = 5) {
-  const n = c.length;
-  for (let i = n - look - 2; i >= look; i--) {
-    const h = c[i][2]; let L = true, R = true;
-    for (let k = 1; k <= look; k++) { if (c[i-k][2] >= h) L=false; if (c[i+k][2] >= h) R=false; }
-    if (L && R) return { idx:i, price:h };
+function swingHigh(c, look=5) {
+  const n=c.length;
+  for (let i=n-look-2;i>=look;i--){
+    const h=c[i][2]; let L=true,R=true;
+    for (let k=1;k<=look;k++){ if(c[i-k][2]>=h)L=false; if(c[i+k][2]>=h)R=false; }
+    if(L&&R)return{idx:i,price:h};
   }
   return null;
 }
-function swingLow(c, look = 5) {
-  const n = c.length;
-  for (let i = n - look - 2; i >= look; i--) {
-    const l = c[i][3]; let L = true, R = true;
-    for (let k = 1; k <= look; k++) { if (c[i-k][3] <= l) L=false; if (c[i+k][3] <= l) R=false; }
-    if (L && R) return { idx:i, price:l };
+function swingLow(c, look=5) {
+  const n=c.length;
+  for (let i=n-look-2;i>=look;i--){
+    const l=c[i][3]; let L=true,R=true;
+    for (let k=1;k<=look;k++){ if(c[i-k][3]<=l)L=false; if(c[i+k][3]<=l)R=false; }
+    if(L&&R)return{idx:i,price:l};
   }
   return null;
 }
-
-function findOrderBlock(c, bosIndex, isUp) {
-  for (let j = bosIndex - 1; j >= Math.max(0, bosIndex - 50); j--) {
-    const o = c[j][1], cl = c[j][4], h = c[j][2], l = c[j][3];
-    const isBear = cl < o, isBull = cl > o;
-    if (isUp && isBear) return OB_USE_WICKS ? { low:l, high:h, idx:j } : { low:Math.min(o,cl), high:Math.max(o,cl), idx:j };
-    if (!isUp && isBull) return OB_USE_WICKS ? { low:l, high:h, idx:j } : { low:Math.min(o,cl), high:Math.max(o,cl), idx:j };
+function findOB(c,bos,isUp){
+  for(let j=bos-1;j>=Math.max(0,bos-50);j--){
+    const o=c[j][1],cl=c[j][4],h=c[j][2],l=c[j][3];
+    const bear=cl<o, bull=cl>o;
+    if(isUp && bear) return OB_USE_WICKS ? { low:l, high:h } : { low:Math.min(o,cl), high:Math.max(o,cl) };
+    if(!isUp && bull) return OB_USE_WICKS ? { low:l, high:h } : { low:Math.min(o,cl), high:Math.max(o,cl) };
   }
   return null;
 }
-
-function pickEntryFromOB(ob, dir) {
-  if (ENTRY_MODE === 'ob_mid') return (ob.low + ob.high) / 2;
-  if (ENTRY_MODE === 'ob_top') return dir === 'LONG' ? ob.high : ob.low;
-  if (ENTRY_MODE === 'ob_bottom') return dir === 'LONG' ? ob.low : ob.high;
-  return (ob.low + ob.high) / 2;
+function entryFromOB(ob,dir){
+  if(ENTRY_MODE==='ob_mid')return(ob.low+ob.high)/2;
+  if(ENTRY_MODE==='ob_top')return dir==='LONG'?ob.high:ob.low;
+  if(ENTRY_MODE==='ob_bottom')return dir==='LONG'?ob.low:ob.high;
+  return (ob.low+ob.high)/2;
 }
 
-/* ===== 產生僅 OB 內觸發的訊號 ===== */
-function genSignal_OB_Only(candles, timeframe) {
-  if (!candles || candles.length < 80) return null;
-  const last = candles.at(-1);
-  const close = last[4];
-  const atr = calcATR(candles, ATR_PERIOD);
-  if (!atr) return null;
+/* ===== SNR ===== */
+// 線性回歸：SNR = |slope| / std(residuals)
+function calcSNR(candles, len = 60) {
+  if (!candles || candles.length < len) return null;
+  const closes = candles.slice(-len).map(r => r[4]);
+  const n = closes.length;
+  const xs = Array.from({ length: n }, (_, i) => i + 1);
+  const mean = arr => arr.reduce((a,b)=>a+b,0)/arr.length;
+  const xBar = mean(xs);
+  const yBar = mean(closes);
+  let num = 0, den = 0;
+  for (let i=0;i<n;i++){ num += (xs[i]-xBar)*(closes[i]-yBar); den += (xs[i]-xBar)**2; }
+  if (den === 0) return null;
+  const slope = num / den;
+  const residuals = closes.map((y,i) => (slope*(xs[i]-xBar)+yBar) - y);
+  const resStd = Math.sqrt(residuals.reduce((a,b)=>a+b*b,0) / Math.max(1, n-2));
+  if (!isFinite(resStd) || resStd === 0) return null;
+  return Math.abs(slope) / resStd;
+}
 
-  const sh = swingHigh(candles, SWING_LOOKBACK);
-  const sl = swingLow(candles, SWING_LOOKBACK);
-  if (!sh || !sl) return null;
+/* ===== 訊號生成（僅 OB 內，含 SNR 過濾、依週期 TP 放大） ===== */
+function genSignal(c, tf){
+  if(!c || c.length < 80) return null;
 
-  const body = Math.abs(last[4] - last[1]);
-  const volOK = body >= ATR_MULT * atr;
+  const last=c.at(-1), close=last[4];
+  const atr=calcATR(c, ATR_PERIOD);
+  if(!atr) return null;
 
-  // 上破 BOS → 找前一根大型空方 K 作為多方 OB
-  if (close > sh.price && volOK) {
-    const bosIdx = candles.length - 1;
-    const ob = findOrderBlock(candles, bosIdx, true);
-    if (!ob) return null;
-    if (!(close <= ob.high && close >= ob.low)) return null; // 僅 OB 內觸發
-    const entry = pickEntryFromOB(ob, 'LONG');
-    const stop = ob.low - atr * SL_ATR_PAD;
+  const sh=swingHigh(c, SWING_LOOKBACK);
+  const sl=swingLow(c, SWING_LOOKBACK);
+  if(!sh||!sl) return null;
+
+  const body=Math.abs(last[4]-last[1]);
+  const volOK=body >= ATR_MULT*atr;
+  if(!volOK) return null;
+
+  // 預先算 SNR（勝率過濾）
+  let snr = null;
+  if (SNR_ENABLED) {
+    snr = calcSNR(c, SNR_LEN);
+    const min = SNR_MIN[tf] ?? 1.0;
+    if (snr == null || snr < min) return null;
+  }
+
+  // 取該週期 TP 配置
+  const RSET = TP_BY_TF[tf] || TP_R_MULTS_DEFAULT;
+
+  // 上破 BOS → 多方 OB
+  if (close > sh.price) {
+    const bos=c.length-1; const ob=findOB(c, bos, true);
+    if(!ob || !(close <= ob.high && close >= ob.low)) return null;
+    const entry=entryFromOB(ob,'LONG');
+    const stop = ob.low - atr*SL_ATR_PAD;
     const risk = entry - stop;
-    const tps = TP_R_MULTS.map(r => entry + r * risk);
-    return { dir:'LONG', timeframe, entry, stop, tps, obLow:ob.low, obHigh:ob.high };
+    const tps = RSET.map(r => entry + r*risk);
+    return { dir:'LONG', timeframe:tf, entry, stop, tps, obLow:ob.low, obHigh:ob.high, snr };
   }
 
-  // 下破 BOS → 找前一根大型多方 K 作為空方 OB
-  if (close < sl.price && volOK) {
-    const bosIdx = candles.length - 1;
-    const ob = findOrderBlock(candles, bosIdx, false);
-    if (!ob) return null;
-    if (!(close <= ob.high && close >= ob.low)) return null; // 僅 OB 內觸發
-    const entry = pickEntryFromOB(ob, 'SHORT');
-    const stop = ob.high + atr * SL_ATR_PAD;
+  // 下破 BOS → 空方 OB
+  if (close < sl.price) {
+    const bos=c.length-1; const ob=findOB(c, bos, false);
+    if(!ob || !(close <= ob.high && close >= ob.low)) return null;
+    const entry=entryFromOB(ob,'SHORT');
+    const stop = ob.high + atr*SL_ATR_PAD;
     const risk = stop - entry;
-    const tps = TP_R_MULTS.map(r => entry - r * risk);
-    return { dir:'SHORT', timeframe, entry, stop, tps, obLow:ob.low, obHigh:ob.high };
+    const tps = RSET.map(r => entry - r*risk);
+    return { dir:'SHORT', timeframe:tf, entry, stop, tps, obLow:ob.low, obHigh:ob.high, snr };
   }
+
   return null;
 }
 
-/* ===== 單幣／多週期分析 ===== */
-async function analyzeOne(symbol, tfList = TIMEFRAMES) {
-  const t = await fetchTickerFlex(symbol);
-  for (const tf of tfList) {
-    const c = await fetchOHLCVFlex(symbol, tf, 300);
-    const sg = genSignal_OB_Only(c, tf);
-    if (sg) return { symbol: t._symbol, price: t.last, pct: t.percentage, ...sg };
-  }
-  return { symbol: t._symbol, price: t.last, pct: t.percentage, dir: null };
-}
-
-async function analyzeAll(tfList = TIMEFRAMES) {
-  const out = [];
-  for (const s of SYMBOLS) {
-    try { out.push(await analyzeOne(s, tfList)); }
-    catch (e) { out.push({ symbol: s, error: e.message }); }
-  }
-  return out;
-}
-
-// 多週期：回傳每週期的訊號
-async function analyzeSymbolMulti(symbol, tfList = ALL_TFS) {
-  const t = await fetchTickerFlex(symbol);
-  const perTf = {};
-  for (const tf of tfList) {
-    try {
-      const c = await fetchOHLCVFlex(symbol, tf, 300);
-      perTf[tf] = genSignal_OB_Only(c, tf); // 可能為 null
-    } catch (e) {
-      perTf[tf] = { error: e.message, timeframe: tf };
-    }
-  }
-  return { symbol: t._symbol, price: t.last, pct: t.percentage, perTf };
-}
-async function analyzeAllMulti(tfList = ALL_TFS) {
-  const out = [];
-  for (const s of SYMBOLS) {
-    try { out.push(await analyzeSymbolMulti(s, tfList)); }
-    catch (e) { out.push({ symbol: s, error: e.message }); }
-  }
-  return out;
-}
-
-/* ===== 訊息格式 ===== */
-// /signal（一般）
-function fmtSignal(rows, onlyHits = false) {
-  const ts = nowTW();
-  let txt = onlyHits
-    ? `📊 潛在進場訊號（僅 OB 內）\n🕒 訊號時間：${ts}\n\n`
-    : `📈 合約即時報價與潛在進場（僅 OB 內）\n🕒 生成時間：${ts}\n\n`;
-
-  for (const r of rows) {
-    if (r.error) { txt += `${r.symbol}\n錯誤：${r.error}\n\n`; continue; }
-    if (!onlyHits) {
-      txt += `${r.symbol}\n價格：${toFixed(r.price, 4)}\n漲跌：${toFixed(r.pct ?? 0, 2)}%\n`;
-    }
-    if (r.dir) {
-      const icon = r.dir === 'LONG' ? '🟢' : '🔴';
-      txt += `${icon} 幣種：${r.symbol}\n`;
-      txt += `方向：${icon} ${r.dir}（${r.timeframe}）\n`;
-      txt += `OB 區間：${toFixed(r.obLow)} ~ ${toFixed(r.obHigh)}\n`;
-      txt += `入場：${toFixed(r.entry)}｜止損：${toFixed(r.stop)}\n`;
-      txt += `🎯 TP1/2/3：${toFixed(r.tps[0])} / ${toFixed(r.tps[1])} / ${toFixed(r.tps[2])}\n\n`;
-    } else if (!onlyHits) {
-      txt += `— 訊號：無\n\n`;
-    }
-  }
-  return txt.trim();
-}
-
-// /summary（多週期匯總：含 5m/15m/30m/1h/4h/1d/1w）
-function fmtSummary(rows) {
-  const ts = nowTW();
-  let out = `📊 多週期潛在進場匯總（僅 OB 內）\n🕒 生成時間：${ts}\n\n`;
-
-  const unify = [];   // 一致方向
-  const diverge = []; // 分歧或缺訊號
-
-  for (const r of rows) {
-    if (r.error) { diverge.push({ symbol:r.symbol, reason:r.error }); continue; }
-
-    const tfKeys = ALL_TFS;
-    const dirs = tfKeys.map(tf => r.perTf[tf]?.dir || null);
-    const haveAny = dirs.some(Boolean);
-    if (!haveAny) { diverge.push({ symbol:r.symbol, reason:'各週期皆無訊號' }); continue; }
-
-    const nonNullDirs = dirs.filter(Boolean);
-    const allSame = nonNullDirs.length>0 && nonNullDirs.every(d => d === nonNullDirs[0]);
-    if (allSame && nonNullDirs.length >= 2) {
-      unify.push({ symbol:r.symbol, dir:nonNullDirs[0], price:r.price, pct:r.pct, perTf:r.perTf });
-    } else {
-      diverge.push({ symbol:r.symbol, price:r.price, pct:r.pct, perTf:r.perTf });
-    }
-  }
-
-  if (unify.length) {
-    out += `🟢 一致方向（所有出現訊號的週期同方向）\n\n`;
-    for (const u of unify) {
-      const icon = u.dir === 'LONG' ? '🟢' : '🔴';
-      out += `${u.symbol}\n現價：${toFixed(u.price,4)}　漲跌：${toFixed(u.pct??0,2)}%\n`;
-      out += `一致方向：${icon} ${u.dir}\n`;
-      for (const tf of ALL_TFS) {
-        const s = u.perTf[tf];
-        if (!s || !s.dir) continue;
-        out += `— ${tf}\n`;
-        out += `OB：${toFixed(s.obLow)} ~ ${toFixed(s.obHigh)}\n`;
-        out += `入場：${toFixed(s.entry)}｜止損：${toFixed(s.stop)}\n`;
-        out += `TP1/2/3：${toFixed(s.tps[0])} / ${toFixed(s.tps[1])} / ${toFixed(s.tps[2])}\n`;
+/* ===== 掃描 ===== */
+async function analyzeAll(tfs){
+  const results=[];
+  for(const s of SYMBOLS){
+    try{
+      const t=await fetchTicker(s);
+      let picked=null;
+      for(const tf of tfs){
+        const c=await fetchOHLCV(s, tf, 300);
+        const sig=genSignal(c, tf);
+        if(sig){ picked={...sig, symbol:s, price:t.last, pct:t.percentage}; break; }
       }
-      out += `\n`;
+      if (picked) results.push(picked);
+    }catch(e){
+      results.push({symbol:s,error:e.message});
     }
   }
+  return results;
+}
 
-  if (diverge.length) {
-    out += `⚠ 多週期分歧/缺訊號\n\n`;
-    for (const d of diverge) {
-      out += `${d.symbol}\n`;
-      if (d.reason) { out += `原因：${d.reason}\n\n`; continue; }
-      out += `現價：${toFixed(d.price,4)}　漲跌：${toFixed(d.pct??0,2)}%\n`;
-      const lines = [];
-      for (const tf of ALL_TFS) {
-        const s = d.perTf?.[tf];
-        if (s?.dir) {
-          const icon = s.dir === 'LONG' ? '🟢' : '🔴';
-          lines.push(`${tf}=${icon}${s.dir}`);
-        } else {
-          lines.push(`${tf}=無`);
-        }
-      }
-      out += `方向：${lines.join('、')}\n\n`;
-    }
+/* ===== 格式化輸出 ===== */
+function fmtSignal(rows, tag){
+  const ts=nowTW();
+  let out = `📡 ${tag}\n🕒 ${ts}\n\n`;
+  for (const r of rows) {
+    if (r.error) { out += `${r.symbol} 錯誤：${r.error}\n\n`; continue; }
+    const icon = r.dir==='LONG' ? '🟢' : '🔴';
+    out += `${icon} ${r.symbol} ${r.dir}（${r.timeframe}）\n`;
+    out += `現價：${toFixed(r.price,4)}｜漲跌：${toFixed(r.pct??0,2)}%\n`;
+    out += `OB：${toFixed(r.obLow)} ~ ${toFixed(r.obHigh)}\n`;
+    out += `入場：${toFixed(r.entry)}｜止損：${toFixed(r.stop)}\n`;
+    out += `🎯 TP1/2/3：${toFixed(r.tps[0])} / ${toFixed(r.tps[1])} / ${toFixed(r.tps[2])}\n`;
+    out += `📈 SNR：${toFixed(r.snr ?? 0, 2)}\n\n`;
   }
-
   return out.trim();
 }
 
-/* ===== 快捷鍵選單 ===== */
-const mainKeyboard = {
-  reply_markup: {
-    keyboard: [
-      [{ text: '📊 即時訊號' }, { text: '📈 高週期訊號' }],
-      [{ text: '📚 多週期匯總' }],
-      [{ text: '🟢 開啟自動推播' }, { text: '🔴 關閉自動推播' }],
-      [{ text: '⚙️ 狀態' }]
-    ],
-    resize_keyboard: true,
-    one_time_keyboard: false
-  }
-};
-
-/* ===== 指令對應的處理函式（供 /command 與快捷鍵共用） ===== */
-async function handleSignal(ctx) {
-  try { const rows = await analyzeAll(TIMEFRAMES); await ctx.reply(fmtSignal(rows)); }
-  catch (e) { await ctx.reply(`查詢失敗：${e.message}`); }
-}
-async function handleSignalHTF(ctx) {
-  try { const rows = await analyzeAll(HTF_TIMEFRAMES); await ctx.reply(fmtSignal(rows)); }
-  catch (e) { await ctx.reply(`查詢失敗：${e.message}`); }
-}
-async function handleSummary(ctx) {
-  try { const rows = await analyzeAllMulti(ALL_TFS); await ctx.reply(fmtSummary(rows)); }
-  catch (e) { await ctx.reply(`匯總失敗：${e.message}`); }
-}
+/* ===== Telegram 控制 ===== */
 const subscribers = new Set();
-async function handleAutoOn(ctx) { subscribers.add(String(ctx.chat.id)); await ctx.reply(`✅ 自動偵測已開啟（每 3 分鐘掃描一次）`); }
-async function handleAutoOff(ctx) { subscribers.delete(String(ctx.chat.id)); await ctx.reply('🛑 自動偵測已關閉'); }
-async function handleStatus(ctx) {
-  await ctx.reply(`模式：${LIVE ? '實單' : '僅報價'}｜市場：${DEFAULT_TYPE}
-週期：${TIMEFRAMES.join(', ')}
-匯總週期：${ALL_TFS.join(', ')}
-訂閱中：${subscribers.size} 個聊天
-時間：${nowTW()}`);
-}
 
-/* ===== Telegram 指令 ===== */
-bot.start((ctx) => ctx.reply('已啟動。請選擇快捷鍵或輸入指令。', mainKeyboard));
-bot.command('signal', handleSignal);
-bot.command('signal_htf', handleSignalHTF);
-bot.command('summary', handleSummary);
-bot.command('auto_on', handleAutoOn);
-bot.command('auto_off', handleAutoOff);
-bot.command('status', handleStatus);
-// 停用下單相關
-bot.command('market', (ctx) => ctx.reply('已停用下單功能（僅提供訊號與報價）'));
-bot.command('limit',  (ctx) => ctx.reply('已停用下單功能（僅提供訊號與報價）'));
+bot.start(ctx => ctx.reply('✅ 多層級掃描（高勝率）版已啟動。\n指令：/auto_on /auto_off /status'));
+bot.command('auto_on', ctx => { subscribers.add(String(ctx.chat.id)); ctx.reply('🟢 自動推播已開啟'); });
+bot.command('auto_off', ctx => { subscribers.delete(String(ctx.chat.id)); ctx.reply('🔴 自動推播已關閉'); });
+bot.command('status', ctx => ctx.reply(
+  `層級：短(3m)=5m/15m｜中(10m)=30m/1h｜長(30m)=4h/1d/1w
+TP 依週期：已啟用｜SNR 過濾：啟用（len=${SNR_LEN}）
+訂閱：${subscribers.size} 個
+時間：${nowTW()}`));
 
-/* 快捷鍵按鈕對應 */
-bot.hears('📊 即時訊號', handleSignal);
-bot.hears('📈 高週期訊號', handleSignalHTF);
-bot.hears('📚 多週期匯總', handleSummary);
-bot.hears('🟢 開啟自動推播', handleAutoOn);
-bot.hears('🔴 關閉自動推播', handleAutoOff);
-bot.hears('⚙️ 狀態', handleStatus);
-
-/* ===== 排程推播（每 3 分鐘只推有訊號者） ===== */
-schedule.scheduleJob(AUTO_CRON, async () => {
-  try {
-    if (subscribers.size === 0) return;
-    const rows = await analyzeAll(TIMEFRAMES);
-    const hits = rows.filter(r => r.dir);
-    if (hits.length === 0) return;
-    const msg = fmtSignal(hits, true);
-    for (const id of subscribers) {
-      await bot.telegram.sendMessage(id, msg).catch(()=>{});
-    }
-  } catch (_) {}
+/* ===== 多層級排程（只推有訊號） ===== */
+schedule.scheduleJob('*/3 * * * *', async()=>{
+  if(!subscribers.size) return;
+  const hits = await analyzeAll(TFS_SHORT);
+  if(hits.length) for(const id of subscribers) await bot.telegram.sendMessage(id, fmtSignal(hits,'短線層（每 3 分鐘）'));
+});
+schedule.scheduleJob('*/10 * * * *', async()=>{
+  if(!subscribers.size) return;
+  const hits = await analyzeAll(TFS_MID);
+  if(hits.length) for(const id of subscribers) await bot.telegram.sendMessage(id, fmtSignal(hits,'中線層（每 10 分鐘）'));
+});
+schedule.scheduleJob('*/30 * * * *', async()=>{
+  if(!subscribers.size) return;
+  const hits = await analyzeAll(TFS_LONG);
+  if(hits.length) for(const id of subscribers) await bot.telegram.sendMessage(id, fmtSignal(hits,'長線層（每 30 分鐘）'));
 });
 
-/* ===== 啟動 ===== */
-process.once('SIGINT', () => { console.log('Bot stopped (SIGINT)'); process.exit(0); });
-process.once('SIGTERM', () => { console.log('Bot stopped (SIGTERM)'); process.exit(0); });
+/* ===== 啟動／收斂 ===== */
+process.once('SIGINT', ()=>{ console.log('Bot stopped (SIGINT)'); process.exit(0); });
+process.once('SIGTERM', ()=>{ console.log('Bot stopped (SIGTERM)'); process.exit(0); });
 
-(async () => {
+(async()=>{
   await bot.telegram.deleteWebhook().catch(()=>{});
   await bot.launch();
-  console.log('🤖 Telegram Bot 已啟動｜快捷鍵選單 + 多週期匯總（含 5m/15m/30m/1h/4h/1d/1w）｜OB 內觸發｜多目標 TP｜3 分鐘自動推播');
+  console.log('🤖 Telegram Bot 已啟動｜多層級(3/10/30) + 依週期TP + SNR（高勝率）');
 })();
